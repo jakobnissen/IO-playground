@@ -235,13 +235,60 @@ function write(io, x::Union{UInt32, UInt64, UInt128})
     write(io, mem)
 end
 
+readchomp(io) = chomp(read(io, String))
+
+readline(;keep::Bool=false) = Base.readline(;keep)
+readline(filename::AbstractString; keep::Bool=false) = Base.readline(filename; keep)
+
+# Helper function
+function writeall(io, x::ImmutableMemoryView{UInt8})
+    n_bytes = length(x)
+    while !isempty(x)
+        n = write(io, x)
+        iszero(n) && error()
+        x = @inbounds x[n:end]
+    end
+    n_bytes
+end
+
+include("writeablevecio.jl")
+
+readline(io; keep::Bool=false) = String(copyline(WriteableVecIO(UInt8[]), io; keep).vec)
+
+copyline(io, filename::AbstractString; keep::Bool=false) = Base.copyline(io, filename; keep)
+
+# We could implement this in terms of copyuntil
+function copyline(out_io, in_io; keep::Bool=false)
+    buffer = get_nonempty_buffer(in_io)
+    isnothing(buffer) && return out_io
+    while true
+        newline = findfirst(==(UInt8('\n')), buffer)
+        if newline === nothing
+            write(out_io, buffer)
+            consume(in_io, length(buffer) % UInt)
+            iszero(fillbuffer(in_io)) && break
+            buffer = getbuffer(in_io)
+        else
+            if keep
+                buffer = @inbounds buffer[1:newline]
+            else
+                win_line = newline > 1 && @inbounds(buffer[newline - 1]) == UInt8('\r')
+                buffer = @inbounds buffer[1:newline - (1 + win_line)]
+            end
+            write(out_io, buffer)
+            consume(in_io, newline % UInt)
+            break
+        end
+    end
+    out_io
+end
+
+readlines(io=stdin; kw...) = collect(eachline(io; kw...))
+
+# TODO: readuntil, copyuntil, readeach, eachline
 
 
-
-
-
-
-
+# copyunril: vectoro f bytes, or string.
 
 
 
@@ -319,6 +366,7 @@ include("devnull.jl")
 include("buffered.jl")
 include("unbuffered.jl")
 include("vecio.jl")
+
 
 end # module iotest
 

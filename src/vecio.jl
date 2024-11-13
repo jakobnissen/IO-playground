@@ -11,9 +11,9 @@ getbuffer(x::VecIO) = @inbounds ImmutableMemoryView(x.vec)[x.pos:lastindex(x.vec
 fillbuffer(x::VecIO) = 0
 
 function consume(x::VecIO, n::UInt)
-    new = x.pos + n
-    new > length(x.vec) + 1 && throw_consume_error()
-    x.pos = new
+    new = x.pos % UInt + n
+    new > (length(x.vec) % UInt) + 1 && throw_consume_error()
+    x.pos = new % Int
 end
 
 flush(::VecIO) = nothing
