@@ -1,6 +1,6 @@
 # Unbuffered, readable type
-struct Unbuffered
-    x::IOBuffer
+struct Unbuffered{T}
+    x::T
 end
 
 Buffering(::Type{Unbuffered}) = NotBuffered()

@@ -1,4 +1,4 @@
-name = "iotest"
+name = "IOTest"
 uuid = "d4c4537f-0338-421f-8f56-9545d9f48e8e"
 authors = ["Jakob Nybo Nissen <jakobnybonissen@gmail.com>"]
 version = "0.1.0"
@@ -8,5 +8,5 @@ MemoryViews = "a791c907-b98b-4e44-8f4d-e4c2362c6b2f"
 Test = "8dfed614-e22c-5e08-85e1-65c5234f0b40"
 
 [compat]
-MemoryViews = "0.2.1"
+MemoryViews = "0.2.2"
 Test = "1.11.0"

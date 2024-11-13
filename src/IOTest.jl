@@ -1,41 +1,43 @@
-module iotest
+module IOTest
 
 using MemoryViews: MemoryView, ImmutableMemoryView, MutableMemoryView
 using Test
 
 ### Core methods
+
+"""
+    Buffering(::Type{T}) -> Union{IsBuffered, NotBuffered}
+
+Trait to signal if a reader IO is buffered.
+Defaults to `IsBuffered()`.
+New unbuffered io types `T` should signal they are unbuffered by implementing
+`Buffering(::Type{T}) = NotBuffered()`.
+"""
 abstract type Buffering end
+
+"See `Buffering`"
 struct IsBuffered <: Buffering end
+
+"See `Buffering`"
 struct NotBuffered <: Buffering end
 
 Buffering(::Type) = IsBuffered()
 
+"Exception thrown when calling `fillbuffer` on an IO with a full buffer that cannot grow"
 struct FullBufferError <: Exception end
+
+"Exception thrown when calling consume(io, n) with a too large value of n"
 struct ConsumedTooMuch <: Exception end
 
 @noinline throw_consume_error() = throw(ConsumedTooMuch())
 
 ### Derived methods
-readinto!(io, mem::MutableMemoryView{UInt8}) = _readinto!(Buffering(typeof(io)), io, mem)
 
-function _readinto!(::IsBuffered, io, mem::MutableMemoryView{UInt8})
-    isempty(mem) && return 0
-    buf = @something get_nonempty_buffer(io) return 0
-    mn = min(length(buf), length(mem))
-    copy!(view(mem, 1:mn), view(buf, 1:mn))
-    consume(io, mn % UInt)
-    return mn
-end
-
-function _readinto!(::NotBuffered, io, mem::ImmutableMemoryView{UInt8})
-    GC.@preserve mem unsafe_read(io, pointer(mem), length(mem) % UInt)
-end
-
-# Default impl of unsafe_read: Convert ref to pointer 
+# Default impl of unsafe_read: Convert ref to pointer
 unsafe_read(io, ref, n::UInt) = GC.@preserve ref unsafe_read(io, Ptr{UInt8}(pointer(ref)), n)
 
-# Default impl of unsafe_read, dispatch on buffering to hit fallback when IO is buffered
-# This throws a MethodError if IO isn't buffered and user hasn't provided an impl of unsafe_read
+# Dispatch on buffering: A buffered reader need not implement unsafe_read,
+# but will get it for free by copying bytes from its buffer
 unsafe_read(io, ptr::Ptr{UInt8}, n::UInt) = _unsafe_read(Buffering(typeof(io)), io, ptr, n)
 
 # For buffered IOs, we can read from the buffer.
@@ -46,11 +48,21 @@ function _unsafe_read(::IsBuffered, io, ptr::Ptr{UInt8}, n::UInt)
     mn % Int
 end
 
-function _readinto!(::NotBuffered, io, mem::MutableMemoryView{UInt8})
+"""
+    readinto!(io, x)
+
+Read bytes from `io` into `x` (interpreted as a `MemoryView`),
+and return the number of bytes read.
+This function should only read zero bytes if `x` contain no bytes, or if `io` is EOF.
+"""
+readinto!(io, x) = readinto!(io, MemoryView{UInt8}(x))
+
+function readinto!(io, mem::MutableMemoryView{UInt8})
     isempty(mem) && return 0
     GC.@preserve mem unsafe_read(io, pointer(mem), sizeof(mem) % UInt)
 end
 
+# Generic implementation of write for any memory-based object.
 function write(io, x)
     mem = ImmutableMemoryView{UInt8}(x)
     isempty(mem) && return 0
@@ -69,7 +81,8 @@ function write(io, s::Symbol)
     return unsafe_write(io, pname, ccall(:strlen, Csize_t, (Cstring,), pname))
 end
 
-# helper function
+# internal helper function - not API
+# returns a nonempty buffer, unless IO is EOF
 function get_nonempty_buffer(io)::Union{ImmutableMemoryView{UInt8}, Nothing}
     buffer = getbuffer(io)
     if isempty(buffer)
@@ -88,6 +101,8 @@ read(io, ::Type{String}) = String(read(io))
 seekstart(io) = seek(io, 0)
 skip(io, n) = seek(io, position(io) + n)
 
+# By default, only buffered readers have a notion
+# of the number of bytes available.
 function readavailable(io)
     buf = getbuffer(io)
     v = Vector{UInt8}(buf)
@@ -100,17 +115,14 @@ end
 # For this usecase, use readall!
 read(io, nb::Int=typemax(Int)) = _read(Buffering(typeof(io)), io, nb)
 
+# For buffered IOs, this is pretty straightforward
 function _read(::IsBuffered, io, nb::Int)
     v = UInt8[]
     n_read = 0
     while n_read < nb
-        buffer = getbuffer(io)
-        if isempty(buffer)
-            fb = fillbuffer(io)
-            iszero(fb) && break
-            buffer = getbuffer(io)
-        end
+        buffer = @something get_nonempty_buffer(io) break
         if n_read + length(buffer) > nb
+            # Don't read too much
             buffer = @inbounds buffer[1:nb - n_read]
         end
         resize!(v, n_read + length(buffer))
@@ -121,9 +133,12 @@ function _read(::IsBuffered, io, nb::Int)
     v
 end
 
+# This is a little more tricky, because for unbuffered IOs, we might not
+# have `bytesavailable`. So, we need to overallocate some extra space,
+# then try to fill it in, and resize back if we reach EOF early.
 function _read(::NotBuffered, io, nb::Int)
     v = UInt8[]
-    bufsize = 2^14 # 16 KiB
+    bufsize = 2^12 # 4 KiB
     n_read = 0
     while n_read < nb
         oldsize = length(v)
@@ -135,18 +150,19 @@ function _read(::NotBuffered, io, nb::Int)
     resize!(v, n_read)
 end
 
+readall!(io, x) = readall!(io, MemoryView{UInt8}(x))
 function readall!(io, mem::MutableMemoryView{UInt8})
-    remaining = mem[begin:end]
     n_read = 0
     while true
-        n = readinto!(io, remaining)
+        n = readinto!(io, mem)
         iszero(n) && break
         n_read += n
-        remaining = mem[begin + n:end]
+        mem = @inbounds mem[begin + n:end]
     end
     return n_read
 end
 
+# We load it from the buffer
 function peek(io, T::Type)
     sz = sizeof(T)
     buffer = getbuffer(io)
@@ -160,41 +176,46 @@ function peek(io, T::Type)
             buffer = getbuffer(io)
         end
     end
-    load_from(T, buffer)
+    # This read method is new - not in Base
+    unsafe_read(T, @inbounds(buffer[1:sz]))
 end
 
 read(io, T::Type) = read(Buffering(typeof(io)), io, T)
 
+# For buffered ones, we can load directly from buffer
 function read(::IsBuffered, io, T::Type)
     y = peek(io, T)
     consume(io, sizeof(T) % UInt)
     y
 end
 
+# Else, we need to read into a Memory, then load from it
 function read(::NotBuffered, io, T::Type)
     sz = sizeof(T)
     mem = Memory{UInt8}(undef, sz)
     n = readinto!(io, MemoryView(mem))
     n < sz && throw(EOFError())
-    load_from(T, ImmutableMemoryView(mem))
+    unsafe_read(T, ImmutableMemoryView(mem))
 end
 
+# New method.
 # The caller must guarantee that mem is long enough.
-load_from(::Type{Int8}, mem::ImmutableMemoryView{UInt8}) = load_from(UInt8, mem) % Int8
-load_from(::Type{T}, mem::ImmutableMemoryView{UInt8}) where T <: Union{Int16, Float16} = load_from(UInt16, mem) % T
-load_from(::Type{T}, mem::ImmutableMemoryView{UInt8}) where T <: Union{Int32, Float32} = load_from(UInt32, mem) % T
-load_from(::Type{T}, mem::ImmutableMemoryView{UInt8}) where T <: Union{Int64, Float64} = load_from(UInt64, mem) % T
-load_from(::Type{Int128}, mem::ImmutableMemoryView{UInt8}) = load_from(UInt128, mem) % Int128
+# By default, we just load them as unsigned ints, then reinterpret
+unsafe_read(::Type{Int8}, mem::ImmutableMemoryView{UInt8}) = unsafe_read(UInt8, mem) % Int8
+unsafe_read(::Type{T}, mem::ImmutableMemoryView{UInt8}) where T <: Union{Int16, Float16} = unsafe_read(UInt16, mem) % T
+unsafe_read(::Type{T}, mem::ImmutableMemoryView{UInt8}) where T <: Union{Int32, Float32} = unsafe_read(UInt32, mem) % T
+unsafe_read(::Type{T}, mem::ImmutableMemoryView{UInt8}) where T <: Union{Int64, Float64} = unsafe_read(UInt64, mem) % T
+unsafe_read(::Type{Int128}, mem::ImmutableMemoryView{UInt8}) = unsafe_read(UInt128, mem) % Int128
 
-function load_from(::Type{UInt8}, mem::ImmutableMemoryView{UInt8})
+function unsafe_read(::Type{UInt8}, mem::ImmutableMemoryView{UInt8})
     @inbounds mem[1]
 end
 
-function load_from(::Type{UInt16}, mem::ImmutableMemoryView{UInt8})
+function unsafe_read(::Type{UInt16}, mem::ImmutableMemoryView{UInt8})
     ltoh(@inbounds(mem[1] % UInt16 | ((mem[2] % UInt16) << 8)))
 end
 
-function load_from(::Type{T}, mem::ImmutableMemoryView{UInt8}) where {T <: Union{UInt32, UInt64, UInt128}}
+function unsafe_read(::Type{T}, mem::ImmutableMemoryView{UInt8}) where {T <: Union{UInt32, UInt64, UInt128}}
     x = zero(T)
     msk = 8 * sizeof(T) - 1
     for i in 1:sizeof(T)
@@ -210,7 +231,8 @@ write(io, x::Union{Int32, Float32}) = write(io, reinterpret(UInt32, x))
 write(io, x::Union{Int64, Float64}) = write(io, reinterpret(UInt64, x))
 write(io, x::Int128) = write(io, reinterpret(UInt128, x))
 
-# TODO: These defaults are very inefficient. Should we even have them?
+# TODO: These defaults are very inefficient because they need to
+# allocate a Memory. Should we even have them?
 function write(io, x::UInt8)
     mem = Memory{UInt8}(undef, 1)
     mem[1] = x
@@ -237,27 +259,23 @@ end
 
 readchomp(io) = chomp(read(io, String))
 
+# Forward this to Base since I don't want to implement stdout yet
 readline(;keep::Bool=false) = Base.readline(;keep)
-readline(filename::AbstractString; keep::Bool=false) = Base.readline(filename; keep)
 
-# Helper function
-function writeall(io, x::ImmutableMemoryView{UInt8})
-    n_bytes = length(x)
-    while !isempty(x)
-        n = write(io, x)
-        iszero(n) && error()
-        x = @inbounds x[n:end]
-    end
-    n_bytes
-end
+# Not do I yet care to implement opening a file and reading it.
+readline(filename::AbstractString; keep::Bool=false) = Base.readline(filename; keep)
 
 include("writeablevecio.jl")
 
-readline(io; keep::Bool=false) = String(copyline(WriteableVecIO(UInt8[]), io; keep).vec)
+# We use the WriteableVecIO here to not have to allocate a heavyweight IOBuffer
+readline(io; keep::Bool=false) = String(copyline(WriteableVecIO(UInt8[]), io; keep))
 
+# We forward as we don't want to implement IOStream yet
 copyline(io, filename::AbstractString; keep::Bool=false) = Base.copyline(io, filename; keep)
 
-# We could implement this in terms of copyuntil
+# TODO: We could implement this in terms of copyuntil
+# We can assume in_io is buffered, because copyline does not make sense
+# for unbuffered IOs
 function copyline(out_io, in_io; keep::Bool=false)
     buffer = get_nonempty_buffer(in_io)
     isnothing(buffer) && return out_io
@@ -286,80 +304,7 @@ end
 readlines(io=stdin; kw...) = collect(eachline(io; kw...))
 
 # TODO: readuntil, copyuntil, readeach, eachline
-
-
-# copyunril: vectoro f bytes, or string.
-
-
-
-
-
-
-
-#=
-
-
-# TODO: These implementations are not great. Should be revisited
-function readbytes!(io, b::AbstractVector{UInt8}, nb::Int=length(b); all::Bool=true)
-    iszero(nb) && return 0
-    _readbytes(MemoryKind(typeof(b)), Buffering(typeof(io)), io, b, nb, all)
-end
-
-function _readbytes(
-    ::IsMemory{MutableMemoryView{UInt8}},
-    ::IsBuffered,
-    io, b, nb, all
-)
-    if all
-        n_read = 0
-        while n_read < nb
-            buffer = @something get_nonempty_buffer(io) return n_read
-            @assert length(buffer) > 0
-            to_read = min(length(buffer), nb - n_read)
-            if length(b) < n_read + to_read
-                resize!(b, n_read + to_read)
-            end
-            dst = (MemoryView(b)[n_read+1:n_read + to_read])::MutableMemoryView{UInt8}
-            @assert length(dst) == to_read
-            src = buffer[1:to_read]
-            copyto!(dst, src)
-            consume(io, to_read)
-            n_read += to_read
-        end
-        @assert n_read == nb
-        return nb
-    else
-        buffer = @something get_nonempty_buffer(io) return 0
-        to_read = min(length(buffer), nb)
-        if length(b) < to_read
-            resize!(b, to_read)
-        end
-        dst = MemoryView(b)::MutableMemoryView{UInt8}
-        src = buffer[1:to_read]
-        copyto!(dst, src)
-        consume(io, to_read)
-        return to_read
-    end
-end
-
-function _readbytes(
-    ::IsMemory{MutableMemoryView{UInt8}},
-    ::NotBuffered,
-    io, b, nb, all
-)
-    chunksize = 2^12 # 4 KiB
-    if all
-        n_read = 0
-        while n_read < nb
-
-        end
-    else
-        isempty(b) && resize!(b, chunksize)
-        readbytes!(io, MemoryView(b))
-    end
-end
-
-=#
+# TODO: readbytes!
 
 include("memio.jl")
 include("devnull.jl")
