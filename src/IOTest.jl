@@ -306,6 +306,7 @@ readlines(io=stdin; kw...) = collect(eachline(io; kw...))
 # TODO: readuntil, copyuntil, readeach, eachline
 # TODO: readbytes!
 
+include("iobuffer.jl")
 include("memio.jl")
 include("devnull.jl")
 include("buffered.jl")
